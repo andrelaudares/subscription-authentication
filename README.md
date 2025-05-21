@@ -65,6 +65,7 @@ Antes de começar, certifique-se de ter instalado:
 
     SUPABASE_URL="SUA_URL_DO_PROJETO_SUPABASE"
     SUPABASE_KEY="SUA_ANON_KEY_DO_SUPABASE" # Geralmente a chave anon para acesso público (seguro com RLS)
+    SUPABASE_SERVICE_KEY="SUA_SERVICE_ROLE_KEY_DO_SUPABASE"
     ASAAS_API_KEY="SUA_CHAVE_DE_API_DO_ASAAS" # Use a chave de Sandbox ou Produção do Asaas
     ```
 
