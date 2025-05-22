@@ -3,6 +3,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from supabase import Client
 import requests
 from fastapi.security import OAuth2PasswordBearer
+from postgrest.exceptions import APIError
 
 from ..models.user import UserRegister, UserLogin, UserProfile
 from ..utils.supabase import supabase_client, supabase_admin
@@ -72,56 +73,120 @@ async def register_user(user_data: UserRegister):
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erro inesperado ao processar com Asaas: {e_asaas_generic}")
 
         # 3. Inserir dados adicionais do usuário utilizando função RPC em vez de inserção direta
+        user_id_for_debug = str(user_id)
+        asaas_customer_id_for_rollback = asaas_customer_id
+
         try:
             print("DEBUG: Tentando inserir usuário através da função RPC insert_new_user...")
-            rpc_response = supabase_admin.rpc(
-                'insert_new_user',
-                {
-                    'user_id': str(user_id),
-                    'user_email': user_data.email,
-                    'user_username': user_data.username,
-                    'user_name': user_data.name,
-                    'user_cpf_cnpj': user_data.cpf_cnpj,
-                    'user_asaas_id': asaas_customer_id,
-                    'user_address': user_data.address,
-                    'user_phone': user_data.phone,
-                    'user_description': user_data.description
-                }
-            ).execute()
+            rpc_params = {
+                'user_id': user_id_for_debug,
+                'user_email': user_data.email,
+                'user_username': user_data.username,
+                'user_name': user_data.name,
+                'user_cpf_cnpj': user_data.cpf_cnpj,
+                'user_asaas_id': asaas_customer_id_for_rollback,
+                'user_address': user_data.address,
+                'user_phone': user_data.phone,
+                'user_description': user_data.description
+            }
             
-            print(f"DEBUG: Resposta da função RPC insert_new_user: {rpc_response}")
+            rpc_call_result = supabase_admin.rpc('insert_new_user', rpc_params).execute()
             
-            if not rpc_response.data or not rpc_response.data.get('success'):
-                print(f"DEBUG: Erro na função RPC insert_new_user: {rpc_response}")
-                error_message = rpc_response.data.get('error') if rpc_response.data else 'Sem detalhes do erro'
-                
-                # Rollback apenas do cliente Asaas, já que não podemos deletar o usuário Auth
-                try:
-                    print(f"DEBUG: Tentando rollback - deletar cliente Asaas {asaas_customer_id}.")
-                    asaas_request("DELETE", f"customers/{asaas_customer_id}")
-                    print(f"DEBUG: Cliente Asaas {asaas_customer_id} deletado (rollback falha RPC).")
-                except Exception as e_delete_asaas_db_fail:
-                    print(f"DEBUG: Erro ao deletar cliente Asaas {asaas_customer_id} durante rollback (falha RPC): {e_delete_asaas_db_fail}")
-                
-                print(f"DEBUG: ATENÇÃO: Usuário {user_id} permanecerá no Supabase Auth mas não está completamente registrado.")
-                raise Exception(f"Falha na função RPC: {error_message}")
+            print(f"DEBUG: Resposta DIRETA da função RPC (pós-execute, se não houve exceção APIError): data='{rpc_call_result.data}', error='{rpc_call_result.error}', status_code='{rpc_call_result.status_code}'")
 
-        except Exception as e_db_insert:
-            print(f"DEBUG: Erro ao inserir dados via RPC: {e_db_insert}")
+            rpc_error_detail_msg = None
+            is_rpc_successful = False
+
+            if rpc_call_result.error:
+                if isinstance(rpc_call_result.error, dict) and rpc_call_result.error.get('success') is True:
+                    is_rpc_successful = True
+                    print(f"DEBUG: RPC indica sucesso via rpc_call_result.error. Dados: {rpc_call_result.error}")
+                else:
+                    err_msg = getattr(rpc_call_result.error, 'message', str(rpc_call_result.error))
+                    rpc_error_detail_msg = f"Campo 'error' presente na resposta da RPC (não exceção): {err_msg}"
+            elif not rpc_call_result.data:
+                rpc_error_detail_msg = "Dados não retornados pela RPC (rpc_call_result.data está vazio/nulo e rpc_call_result.error também)."
+            else:
+                data_to_check = None
+                if isinstance(rpc_call_result.data, list):
+                    if len(rpc_call_result.data) > 0:
+                        data_to_check = rpc_call_result.data[0]
+                        if not isinstance(data_to_check, dict):
+                             rpc_error_detail_msg = f"Elemento da lista de dados da RPC não é um dicionário: {type(data_to_check)}"
+                             data_to_check = None
+                    else:
+                        rpc_error_detail_msg = "Dados da RPC são uma lista vazia."
+                elif isinstance(rpc_call_result.data, dict):
+                    data_to_check = rpc_call_result.data
+                else:
+                    rpc_error_detail_msg = f"Dados da RPC em formato inesperado: {type(rpc_call_result.data)}"
+
+                if data_to_check and isinstance(data_to_check, dict):
+                    if data_to_check.get('success') is True:
+                        is_rpc_successful = True
+                        print(f"DEBUG: RPC indica sucesso nos dados retornados em rpc_call_result.data. Dados: {data_to_check}")
+                    else:
+                        error_from_data = data_to_check.get('error', 'Campo "error" não encontrado ou "success" não é true nos dados da RPC.')
+                        rpc_error_detail_msg = f"RPC não indicou sucesso ('success': true) nos dados de rpc_call_result.data: {error_from_data}. Dados: {data_to_check}"
+                elif not rpc_error_detail_msg:
+                     rpc_error_detail_msg = "Não foi possível determinar o status da RPC a partir dos dados formatados em rpc_call_result.data."
+
+            if not is_rpc_successful:
+                final_error_message = f"Falha na etapa de inserção de dados (análise da resposta RPC): {rpc_error_detail_msg or 'Erro desconhecido na lógica de processamento da RPC.'}"
+                print(f"DEBUG: {final_error_message}")
+                
+                if asaas_customer_id_for_rollback:
+                    try:
+                        print(f"DEBUG: Tentando rollback (falha na análise da RPC) - deletar cliente Asaas {asaas_customer_id_for_rollback}.")
+                        asaas_request("DELETE", f"customers/{asaas_customer_id_for_rollback}")
+                        print(f"DEBUG: Cliente Asaas {asaas_customer_id_for_rollback} deletado.")
+                    except Exception as e_delete_asaas:
+                        print(f"DEBUG: Erro ao deletar cliente Asaas {asaas_customer_id_for_rollback} durante rollback: {e_delete_asaas}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=final_error_message)
+
+        except HTTPException:
+            raise
+        except APIError as e_api_error:
+            print(f"DEBUG: APIError da PostgREST capturada. Tipo: {type(e_api_error)}, Detalhes: {e_api_error}")
             
-            # Rollback apenas do cliente Asaas, já que não podemos deletar o usuário Auth
+            error_payload = None
             try:
-                print(f"DEBUG: Tentando rollback - deletar cliente Asaas {asaas_customer_id}.")
-                asaas_request("DELETE", f"customers/{asaas_customer_id}")
-                print(f"DEBUG: Cliente Asaas {asaas_customer_id} deletado (rollback falha RPC).")
-            except Exception as e_delete_asaas_db_fail:
-                print(f"DEBUG: Erro ao deletar cliente Asaas {asaas_customer_id} durante rollback (falha RPC): {e_delete_asaas_db_fail}")
-            
-            print(f"DEBUG: ATENÇÃO: Usuário {user_id} permanecerá no Supabase Auth mas não está completamente registrado.")
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erro ao salvar dados do usuário no banco de dados: {e_db_insert}")
+                error_payload = e_api_error.json()
+                print(f"DEBUG: Payload JSON da APIError: {error_payload}")
+            except Exception as json_parse_err:
+                print(f"DEBUG: Não foi possível parsear JSON da APIError ou e_api_error.json() não é um método/não existe: {json_parse_err}. Conteúdo da exceção: {e_api_error}")
 
-        print(f"DEBUG: Usuário {user_id} registrado e dados salvos com sucesso.")
-        print(f"DEBUG: Buscando perfil do usuário {user_id} para resposta.")
+            if isinstance(error_payload, dict) and error_payload.get('success') is True:
+                print(f"DEBUG: APIError continha um payload de SUCESSO da RPC: {error_payload}. Tratando como sucesso e prosseguindo SEM rollback.")
+            else:
+                print(f"DEBUG: APIError tratada como FALHA. Payload: {error_payload if error_payload else 'N/A'}. Rollback será efetuado.")
+                if asaas_customer_id_for_rollback:
+                    try:
+                        print(f"DEBUG: Tentando rollback (APIError como falha) - deletar cliente Asaas {asaas_customer_id_for_rollback}.")
+                        asaas_request("DELETE", f"customers/{asaas_customer_id_for_rollback}")
+                        print(f"DEBUG: Cliente Asaas {asaas_customer_id_for_rollback} deletado.")
+                    except Exception as e_delete_asaas_api_err:
+                        print(f"DEBUG: Erro ao deletar cliente Asaas {asaas_customer_id_for_rollback} durante rollback: {e_delete_asaas_api_err}")
+                
+                final_error_message = f"Erro da API PostgREST ao salvar dados do usuário: {str(error_payload or e_api_error)}"
+                print(f"DEBUG: ATENÇÃO: Usuário {user_id_for_debug} permanecerá no Supabase Auth mas não está completamente registrado devido a: {final_error_message}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=final_error_message)
+        
+        except Exception as e_general_unexpected:
+            print(f"DEBUG: Exceção GENÉRICA INESPERADA capturada (não HTTPException, não APIError). Tipo: {type(e_general_unexpected)}, Conteúdo: {e_general_unexpected}")
+            if asaas_customer_id_for_rollback:
+                try:
+                    print(f"DEBUG: Tentando rollback (exceção genérica) - deletar cliente Asaas {asaas_customer_id_for_rollback}.")
+                    asaas_request("DELETE", f"customers/{asaas_customer_id_for_rollback}")
+                    print(f"DEBUG: Cliente Asaas {asaas_customer_id_for_rollback} deletado.")
+                except Exception as e_delete_asaas_general_err:
+                    print(f"DEBUG: Erro ao deletar cliente Asaas {asaas_customer_id_for_rollback} durante rollback: {e_delete_asaas_general_err}")
+            
+            print(f"DEBUG: ATENÇÃO: Usuário {user_id_for_debug} permanecerá no Supabase Auth mas não está completamente registrado devido a erro inesperado.")
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Erro crítico e inesperado no servidor: {e_general_unexpected}")
+
+        print(f"DEBUG: Usuário {user_id_for_debug} registrado e dados salvos com sucesso (após lógica RPC e tratamento de exceções).")
+        print(f"DEBUG: Buscando perfil do usuário {user_id_for_debug} para resposta.")
         profile_response = supabase_admin.from_('users').select("*").eq('id', str(user_id)).single().execute()
         print(f"DEBUG: Resposta da busca de perfil: {profile_response}")
         if not profile_response.data:
